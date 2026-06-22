@@ -742,13 +742,24 @@ export default function App() {
     const numParcelasInt = parseInt(formEmprestimo.numParcelas) || 2;
 
     const atualizarNumParcelas = (n) => {
-      const arr = Array.from({ length: n }, (_, i) => formEmprestimo.parcelasDetalhe[i] || { valor: "", data: "" });
-      setFormEmprestimo({ ...formEmprestimo, numParcelas: String(n), parcelasDetalhe: arr });
+      setFormEmprestimo((prev) => {
+        const arr = Array.from({ length: n }, (_, i) => (prev.parcelasDetalhe && prev.parcelasDetalhe[i]) || { valor: "", data: "" });
+        return { ...prev, numParcelas: String(n), parcelasDetalhe: arr };
+      });
+    };
+    const ativarParcelado = () => {
+      setFormEmprestimo((prev) => {
+        const n = parseInt(prev.numParcelas) || 2;
+        const arr = Array.from({ length: n }, (_, i) => (prev.parcelasDetalhe && prev.parcelasDetalhe[i]) || { valor: "", data: "" });
+        return { ...prev, formaPagamento: "parcelado", numParcelas: String(n), parcelasDetalhe: arr };
+      });
     };
     const atualizarParcela = (i, campo, valor) => {
-      const arr = [...formEmprestimo.parcelasDetalhe];
-      arr[i] = { ...arr[i], [campo]: valor };
-      setFormEmprestimo({ ...formEmprestimo, parcelasDetalhe: arr });
+      setFormEmprestimo((prev) => {
+        const arr = [...prev.parcelasDetalhe];
+        arr[i] = { ...arr[i], [campo]: valor };
+        return { ...prev, parcelasDetalhe: arr };
+      });
     };
     const somaParcelas = (formEmprestimo.parcelasDetalhe || []).reduce((a, p) => a + (parseFloat(p.valor) || 0), 0);
 
@@ -837,7 +848,7 @@ export default function App() {
                 À vista
               </button>
               <button
-                onClick={() => { setFormEmprestimo({ ...formEmprestimo, formaPagamento: "parcelado" }); atualizarNumParcelas(parseInt(formEmprestimo.numParcelas) || 2); }}
+                onClick={ativarParcelado}
                 style={{ flex: 1, padding: "10px", fontSize: 13, borderRadius: 10, background: formEmprestimo.formaPagamento === "parcelado" ? ACENTO : BG_CARD_2, color: formEmprestimo.formaPagamento === "parcelado" ? "#06251A" : TEXTO, border: `1px solid ${formEmprestimo.formaPagamento === "parcelado" ? ACENTO : BORDA}` }}
               >
                 Parcelado
