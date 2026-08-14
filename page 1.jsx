@@ -4,13 +4,12 @@ import {
   Plus, X, Check, Clock, AlertTriangle, TrendingUp,
   User, ChevronRight, Star, Heart, Frown,
   Home, FileText, Search, ThumbsUp, ThumbsDown, Calendar,
-  Package, ShoppingBag, ArrowLeft, BarChart3, Image, Trash2, Upload, Bell, BellOff
+  Package, ShoppingBag, ArrowLeft, BarChart3, Image, Trash2, Upload, Bell, BellOff, PieChart
 } from "lucide-react";
 import { BarChart, Bar, XAxis, YAxis, ResponsiveContainer, Tooltip, CartesianGrid } from "recharts";
 import { supabase } from "../lib/supabase";
 
-const JUROS_PERCENTUAL = 0.4;
-const MULTA_DIARIA_PERCENTUAL = 0.1;
+const MULTA_DIARIA_PERCENTUAL = 0; // multa automática desativada - juros definido manualmente
 
 // Tema dark
 const BG = "#121417";
@@ -58,10 +57,26 @@ function diasAte(vencimento) {
   return Math.round((venc - hoje) / 86400000);
 }
 function calcularValoresEmprestimo(emp) {
-  const valorComJuros = emp.valorOriginal * (1 + JUROS_PERCENTUAL);
+  const valorPrevisto = emp.valorPrevisto != null ? emp.valorPrevisto : emp.valorOriginal;
   const atraso = emp.pago ? 0 : diasAtraso(emp.vencimento);
-  const multa = valorComJuros * MULTA_DIARIA_PERCENTUAL * atraso;
-  return { valorComJuros, atraso, multa, totalDevido: valorComJuros + multa };
+  return { valorComJuros: valorPrevisto, atraso, multa: 0, totalDevido: valorPrevisto };
+}
+function calcularValoresParcela(parcela) {
+  if (parcela.renegociado && parcela.valorRenegociado != null) {
+    return { atraso: 0, multa: 0, totalDevido: parcela.valorRenegociado, valorBase: parcela.valorRenegociado };
+  }
+  const atraso = parcela.pago ? 0 : diasAtraso(parcela.vencimento);
+  return { atraso, multa: 0, totalDevido: parcela.valorOriginal, valorBase: parcela.valorOriginal };
+}
+function statusParcela(parcela) {
+  if (parcela.pago) return "pago";
+  const dias = diasAte(parcela.vencimento);
+  if (dias < 0) return "atrasado";
+  if (dias <= 3) return "proximo";
+  return "ok";
+}
+function totalDevidoEmprestimoPorParcelas(parcelas) {
+  return parcelas.reduce((acc, p) => acc + calcularValoresParcela(p).totalDevido, 0);
 }
 function statusEmprestimo(emp) {
   if (emp.pago) return "pago";
@@ -112,7 +127,7 @@ function NavInferior({ pagina, navegar }) {
     { id: "historico", label: "Histórico", icon: FileText },
     { id: "dashboard", label: "Início", icon: Home, central: true },
     { id: "estoque", label: "Estoque", icon: Package },
-    { id: "desempenho", label: "Desempenho", icon: BarChart3 },
+    { id: "contabilidade", label: "Finanças", icon: PieChart },
   ];
   return (
     <div style={{
@@ -219,9 +234,16 @@ export default function App() {
   const [pagina, setPagina] = useState("dashboard");
   const [clientes, setClientes] = useState([]);
   const [emprestimos, setEmprestimos] = useState([]);
+  const [parcelas, setParcelas] = useState([]);
   const [produtos, setProdutos] = useState([]);
   const [loading, setLoading] = useState(true);
   const [clienteSelecionado, setClienteSelecionado] = useState(null);
+  const [emprestimoSelecionado, setEmprestimoSelecionado] = useState(null);
+  const [renegociandoParcela, setRenegociandoParcela] = useState(null);
+  const [valorRenegociacao, setValorRenegociacao] = useState("");
+  const [editandoEmprestimo, setEditandoEmprestimo] = useState(null);
+  const [editandoParcela, setEditandoParcela] = useState(null);
+  const [formEdicao, setFormEdicao] = useState({});
   const [produtoSelecionado, setProdutoSelecionado] = useState(null);
   const [busca, setBusca] = useState("");
   const [filtroHistorico, setFiltroHistorico] = useState("todos");
@@ -230,9 +252,12 @@ export default function App() {
   const [enviandoFoto, setEnviandoFoto] = useState(false);
   const [erroExclusao, setErroExclusao] = useState("");
   const [statusNotificacao, setStatusNotificacao] = useState("indisponivel");
+  const [contasOrigem, setContasOrigem] = useState(["Nubank", "Itaú"]);
+  const [novaContaInput, setNovaContaInput] = useState("");
+  const [mostrarNovaConta, setMostrarNovaConta] = useState(false);
 
   const [formCliente, setFormCliente] = useState({ nomeCompleto: "", cpf: "", rg: "", endereco: "", telefone: "", classificacao: "novo" });
-  const [formEmprestimo, setFormEmprestimo] = useState({ clienteId: "", valorOriginal: "", vencimento: "", observacao: "", pagamento: {} });
+  const [formEmprestimo, setFormEmprestimo] = useState({ clienteId: "", valorOriginal: "", valorPrevisto: "", contaOrigem: "", formaPagamento: "avista", numParcelas: "2", parcelasDetalhe: [], vencimento: "", observacao: "", pagamento: {} });
   const [formProduto, setFormProduto] = useState({ nome: "", precoCompra: "", precoVenda: "", especificacoes: "", quantidade: "1" });
 
   const loadData = useCallback(async () => {
@@ -243,6 +268,10 @@ export default function App() {
     try {
       const { data: e2 } = await supabase.from("emprestimos").select("*").order("criado_em", { ascending: false });
       if (e2) setEmprestimos(e2.map(mapEmprestimoFromDb));
+    } catch (e) {}
+    try {
+      const { data: parc } = await supabase.from("parcelas").select("*").order("numero", { ascending: true });
+      if (parc) setParcelas(parc.map(mapParcelaFromDb));
     } catch (e) {}
     try {
       const { data: p } = await supabase.from("produtos").select("*").order("criado_em", { ascending: false });
@@ -358,14 +387,38 @@ export default function App() {
   };
 
   const adicionarEmprestimo = async () => {
-    if (!formEmprestimo.clienteId || !formEmprestimo.valorOriginal || !formEmprestimo.vencimento) return;
+    if (!formEmprestimo.clienteId || !formEmprestimo.valorOriginal || !formEmprestimo.valorPrevisto || !formEmprestimo.vencimento) return;
     const { data, error } = await supabase.from("emprestimos").insert({
       cliente_id: formEmprestimo.clienteId, valor_original: parseFloat(formEmprestimo.valorOriginal),
+      valor_previsto: parseFloat(formEmprestimo.valorPrevisto),
+      conta_origem: formEmprestimo.contaOrigem, forma_pagamento: formEmprestimo.formaPagamento,
+      parcelas: formEmprestimo.formaPagamento === "parcelado" ? formEmprestimo.parcelasDetalhe : null,
       vencimento: formEmprestimo.vencimento, observacao: formEmprestimo.observacao,
       pagamento: formEmprestimo.pagamento, pago: false,
     }).select().single();
-    if (!error && data) setEmprestimos([mapEmprestimoFromDb(data), ...emprestimos]);
-    setFormEmprestimo({ clienteId: "", valorOriginal: "", vencimento: "", observacao: "", pagamento: {} });
+
+    if (!error && data) {
+      setEmprestimos([mapEmprestimoFromDb(data), ...emprestimos]);
+
+      let novasParcelas = [];
+      if (formEmprestimo.formaPagamento === "parcelado" && formEmprestimo.parcelasDetalhe.length > 0) {
+        novasParcelas = formEmprestimo.parcelasDetalhe.map((p, i) => ({
+          emprestimo_id: data.id, numero: i + 1,
+          valor_original: parseFloat(p.valor) || 0, vencimento: p.data || formEmprestimo.vencimento,
+          pago: false,
+        }));
+      } else {
+        novasParcelas = [{
+          emprestimo_id: data.id, numero: 1,
+          valor_original: parseFloat(formEmprestimo.valorPrevisto), vencimento: formEmprestimo.vencimento,
+          pago: false,
+        }];
+      }
+      const { data: parcelasInseridas } = await supabase.from("parcelas").insert(novasParcelas).select();
+      if (parcelasInseridas) setParcelas([...parcelas, ...parcelasInseridas.map(mapParcelaFromDb)]);
+    }
+
+    setFormEmprestimo({ clienteId: "", valorOriginal: "", valorPrevisto: "", contaOrigem: "", formaPagamento: "avista", numParcelas: "2", parcelasDetalhe: [], vencimento: "", observacao: "", pagamento: {} });
     setPagina("dashboard");
   };
 
@@ -383,23 +436,108 @@ export default function App() {
     const id = avaliandoEmprestimo;
     const pagoEm = new Date().toISOString();
     const { error } = await supabase.from("emprestimos").update({ pago: true, pago_em: pagoEm, avaliacao }).eq("id", id);
-    if (!error) setEmprestimos(emprestimos.map((e) => (e.id === id ? { ...e, pago: true, pagoEm, avaliacao } : e)));
+    if (!error) {
+      setEmprestimos(emprestimos.map((e) => (e.id === id ? { ...e, pago: true, pagoEm, avaliacao } : e)));
+      const parcelasDoEmprestimo = parcelas.filter((p) => p.emprestimoId === id && !p.pago);
+      if (parcelasDoEmprestimo.length > 0) {
+        await supabase.from("parcelas").update({ pago: true, pago_em: pagoEm }).eq("emprestimo_id", id);
+        setParcelas(parcelas.map((p) => (p.emprestimoId === id ? { ...p, pago: true, pagoEm } : p)));
+      }
+    }
     setAvaliandoEmprestimo(null);
   };
   const excluirEmprestimo = async (id) => {
     const { error } = await supabase.from("emprestimos").delete().eq("id", id);
-    if (!error) setEmprestimos(emprestimos.filter((e) => e.id !== id));
+    if (!error) {
+      setEmprestimos(emprestimos.filter((e) => e.id !== id));
+      setParcelas(parcelas.filter((p) => p.emprestimoId !== id));
+    }
+  };
+
+  const togglePagoParcela = async (parcelaId) => {
+    const parcela = parcelas.find((p) => p.id === parcelaId);
+    if (!parcela) return;
+    const novoPago = !parcela.pago;
+    const pagoEm = novoPago ? new Date().toISOString() : null;
+    const { error } = await supabase.from("parcelas").update({ pago: novoPago, pago_em: pagoEm }).eq("id", parcelaId);
+    if (!error) {
+      const novasParcelas = parcelas.map((p) => (p.id === parcelaId ? { ...p, pago: novoPago, pagoEm } : p));
+      setParcelas(novasParcelas);
+      const parcelasDoEmprestimo = novasParcelas.filter((p) => p.emprestimoId === parcela.emprestimoId);
+      const todasPagas = parcelasDoEmprestimo.every((p) => p.pago);
+      const empAtual = emprestimos.find((e) => e.id === parcela.emprestimoId);
+      if (empAtual && empAtual.pago !== todasPagas) {
+        await supabase.from("emprestimos").update({ pago: todasPagas, pago_em: todasPagas ? new Date().toISOString() : null }).eq("id", parcela.emprestimoId);
+        setEmprestimos(emprestimos.map((e) => (e.id === parcela.emprestimoId ? { ...e, pago: todasPagas } : e)));
+      }
+    }
+  };
+
+  const abrirRenegociacao = (parcelaId) => {
+    const parcela = parcelas.find((p) => p.id === parcelaId);
+    setValorRenegociacao(parcela && parcela.renegociado ? String(parcela.valorRenegociado) : "");
+    setRenegociandoParcela(parcelaId);
+  };
+
+  const confirmarRenegociacao = async () => {
+    const id = renegociandoParcela;
+    const valor = parseFloat(valorRenegociacao);
+    if (!id || !valor) return;
+    const { error } = await supabase.from("parcelas").update({ renegociado: true, valor_renegociado: valor }).eq("id", id);
+    if (!error) setParcelas(parcelas.map((p) => (p.id === id ? { ...p, renegociado: true, valorRenegociado: valor } : p)));
+    setRenegociandoParcela(null);
+    setValorRenegociacao("");
+  };
+
+  const removerRenegociacao = async (parcelaId) => {
+    const { error } = await supabase.from("parcelas").update({ renegociado: false, valor_renegociado: null }).eq("id", parcelaId);
+    if (!error) setParcelas(parcelas.map((p) => (p.id === parcelaId ? { ...p, renegociado: false, valorRenegociado: null } : p)));
+  };
+
+  const abrirEdicaoEmprestimo = (emp) => {
+    setFormEdicao({ valorOriginal: String(emp.valorOriginal), valorPrevisto: String(emp.valorPrevisto), vencimento: emp.vencimento, observacao: emp.observacao || "" });
+    setEditandoEmprestimo(emp.id);
+  };
+  const salvarEdicaoEmprestimo = async () => {
+    const id = editandoEmprestimo;
+    const { error } = await supabase.from("emprestimos").update({
+      valor_original: parseFloat(formEdicao.valorOriginal),
+      valor_previsto: parseFloat(formEdicao.valorPrevisto),
+      vencimento: formEdicao.vencimento,
+      observacao: formEdicao.observacao,
+    }).eq("id", id);
+    if (!error) setEmprestimos(emprestimos.map((e) => e.id === id ? { ...e, valorOriginal: parseFloat(formEdicao.valorOriginal), valorPrevisto: parseFloat(formEdicao.valorPrevisto), vencimento: formEdicao.vencimento, observacao: formEdicao.observacao } : e));
+    setEditandoEmprestimo(null);
+  };
+
+  const abrirEdicaoParcela = (parcela) => {
+    setFormEdicao({ valorOriginal: String(parcela.valorOriginal), vencimento: parcela.vencimento });
+    setEditandoParcela(parcela.id);
+  };
+  const salvarEdicaoParcela = async () => {
+    const id = editandoParcela;
+    const { error } = await supabase.from("parcelas").update({
+      valor_original: parseFloat(formEdicao.valorOriginal),
+      vencimento: formEdicao.vencimento,
+    }).eq("id", id);
+    if (!error) setParcelas(parcelas.map((p) => p.id === id ? { ...p, valorOriginal: parseFloat(formEdicao.valorOriginal), vencimento: formEdicao.vencimento } : p));
+    setEditandoParcela(null);
   };
 
   const adicionarProduto = async () => {
     if (!formProduto.nome || !formProduto.precoCompra) return;
-    const { data, error } = await supabase.from("produtos").insert({
-      nome: formProduto.nome, preco_compra: parseFloat(formProduto.precoCompra),
-      preco_venda: formProduto.precoVenda ? parseFloat(formProduto.precoVenda) : null,
-      especificacoes: formProduto.especificacoes, quantidade: parseInt(formProduto.quantidade) || 1,
-      vendido: false,
-    }).select().single();
-    if (!error && data) setProdutos([mapProdutoFromDb(data), ...produtos]);
+    const quantidade = parseInt(formProduto.quantidade) || 1;
+    const novosProdutos = [];
+    for (let i = 0; i < quantidade; i++) {
+      const { data, error } = await supabase.from("produtos").insert({
+        nome: formProduto.nome, preco_compra: parseFloat(formProduto.precoCompra),
+        preco_venda: null,
+        especificacoes: formProduto.especificacoes, quantidade: 1,
+        vendido: false,
+      }).select().single();
+      if (!error && data) novosProdutos.push(mapProdutoFromDb(data));
+    }
+    if (novosProdutos.length > 0) setProdutos([...novosProdutos, ...produtos]);
     setFormProduto({ nome: "", precoCompra: "", precoVenda: "", especificacoes: "", quantidade: "1" });
     setPagina("estoque");
   };
@@ -426,10 +564,10 @@ export default function App() {
   const anoAtual = agora.getFullYear();
   const emprestimosDoMes = emprestimos.filter((e) => { const c = new Date(e.criadoEm); return c.getMonth() === mesAtual && c.getFullYear() === anoAtual; });
   const totalEmprestadoMes = emprestimosDoMes.reduce((a, e) => a + e.valorOriginal, 0);
-  const totalRetornoMes = emprestimosDoMes.reduce((a, e) => a + calcularValoresEmprestimo(e).totalDevido, 0);
+  const totalRetornoMes = emprestimosDoMes.reduce((a, e) => a + totalDevidoEmprestimoPorParcelas(parcelas.filter((p) => p.emprestimoId === e.id)), 0);
   const totalLucroEmprestimoMes = totalRetornoMes - totalEmprestadoMes;
-  const totalAReceber = emprestimos.filter((e) => !e.pago).reduce((a, e) => a + calcularValoresEmprestimo(e).totalDevido, 0);
-  const atrasados = emprestimos.filter((e) => statusEmprestimo(e) === "atrasado").length;
+  const totalAReceber = parcelas.filter((p) => !p.pago).reduce((a, p) => a + calcularValoresParcela(p).totalDevido, 0);
+  const atrasados = parcelas.filter((p) => statusParcela(p) === "atrasado").length;
 
   // ---- Totais Vendas ----
   const produtosVendidosDoMes = produtos.filter((p) => { if (!p.vendido || !p.vendidoEm) return false; const v = new Date(p.vendidoEm); return v.getMonth() === mesAtual && v.getFullYear() === anoAtual; });
@@ -462,8 +600,10 @@ export default function App() {
     return buckets;
   })();
 
+  const emprestimoTemParcelaAtrasada = (empId) => parcelas.some((p) => p.emprestimoId === empId && statusParcela(p) === "atrasado");
+
   const emprestimosFiltrados = emprestimos
-    .filter((e) => { if (filtroHistorico === "todos") return true; if (filtroHistorico === "pendentes") return !e.pago; if (filtroHistorico === "atrasados") return statusEmprestimo(e) === "atrasado"; if (filtroHistorico === "pagos") return e.pago; return true; })
+    .filter((e) => { if (filtroHistorico === "todos") return true; if (filtroHistorico === "pendentes") return !e.pago; if (filtroHistorico === "atrasados") return emprestimoTemParcelaAtrasada(e.id); if (filtroHistorico === "pagos") return e.pago; return true; })
     .sort((a, b) => { if (a.pago !== b.pago) return a.pago ? 1 : -1; return new Date(a.vencimento) - new Date(b.vencimento); });
 
   const clientesFiltrados = clientes.filter((c) => c.nomeCompleto.toLowerCase().includes(busca.toLowerCase()));
@@ -675,8 +815,12 @@ export default function App() {
         <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: "1.25rem" }}>
           {empCliente.length === 0 && <p style={{ fontSize: 13, color: TEXTO_SEC }}>Nenhum empréstimo registrado ainda.</p>}
           {empCliente.map((e) => {
-            const status = statusEmprestimo(e); const cfg = STATUS_CFG[status]; const { totalDevido } = calcularValoresEmprestimo(e);
-            return <div key={e.id} style={{ background: BG_CARD_2, borderRadius: 10, padding: "0.75rem 1rem", display: "flex", justifyContent: "space-between", alignItems: "center" }}><span style={{ fontSize: 12, fontWeight: 500, padding: "2px 8px", borderRadius: 6, background: cfg.bg, color: cfg.text }}>{cfg.label}</span><span style={{ fontSize: 14, fontWeight: 600 }}>{formatBRL(totalDevido)}</span></div>;
+            const parcelasDoEmp = parcelas.filter((p) => p.emprestimoId === e.id);
+            const algumaAtrasada = parcelasDoEmp.some((p) => statusParcela(p) === "atrasado");
+            const status = e.pago ? "pago" : algumaAtrasada ? "atrasado" : "ok";
+            const cfg = STATUS_CFG[status];
+            const totalDevido = totalDevidoEmprestimoPorParcelas(parcelasDoEmp);
+            return <div key={e.id} onClick={() => { setEmprestimoSelecionado(e.id); setPagina("detalheEmprestimo"); }} style={{ background: BG_CARD_2, borderRadius: 10, padding: "0.75rem 1rem", display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }}><span style={{ fontSize: 12, fontWeight: 500, padding: "2px 8px", borderRadius: 6, background: cfg.bg, color: cfg.text }}>{cfg.label}</span><span style={{ fontSize: 14, fontWeight: 600 }}>{formatBRL(totalDevido)}</span></div>;
           })}
         </div>
 
@@ -731,8 +875,49 @@ export default function App() {
 
   // ================= NOVO EMPRÉSTIMO =================
   if (pagina === "novoEmprestimo") {
-    const valorNum = parseFloat(formEmprestimo.valorOriginal) || 0;
-    const valorComJuros = valorNum * (1 + JUROS_PERCENTUAL);
+    const valorEmprestadoNum = parseFloat(formEmprestimo.valorOriginal) || 0;
+    const valorPrevistoNum = parseFloat(formEmprestimo.valorPrevisto) || 0;
+    const lucroPrevisto = valorPrevistoNum - valorEmprestadoNum;
+    const numParcelasInt = parseInt(formEmprestimo.numParcelas) || 2;
+
+    const atualizarNumParcelas = (n) => {
+      setFormEmprestimo((prev) => {
+        const arr = Array.from({ length: n }, (_, i) => (prev.parcelasDetalhe && prev.parcelasDetalhe[i]) || { valor: "", data: "" });
+        return { ...prev, numParcelas: String(n), parcelasDetalhe: arr };
+      });
+    };
+    const ativarParcelado = () => {
+      setFormEmprestimo((prev) => {
+        const n = parseInt(prev.numParcelas) || 2;
+        const arr = Array.from({ length: n }, (_, i) => (prev.parcelasDetalhe && prev.parcelasDetalhe[i]) || { valor: "", data: "" });
+        return { ...prev, formaPagamento: "parcelado", numParcelas: String(n), parcelasDetalhe: arr };
+      });
+    };
+    const atualizarParcela = (i, campo, valor) => {
+      setFormEmprestimo((prev) => {
+        const arr = [...prev.parcelasDetalhe];
+        arr[i] = { ...arr[i], [campo]: valor };
+        return { ...prev, parcelasDetalhe: arr };
+      });
+    };
+    const somaParcelas = (formEmprestimo.parcelasDetalhe || []).reduce((a, p) => a + (parseFloat(p.valor) || 0), 0);
+
+    const adicionarNovaConta = () => {
+      if (novaContaInput.trim() && !contasOrigem.includes(novaContaInput.trim())) {
+        setContasOrigem([...contasOrigem, novaContaInput.trim()]);
+        setFormEmprestimo({ ...formEmprestimo, contaOrigem: novaContaInput.trim() });
+      }
+      setNovaContaInput("");
+      setMostrarNovaConta(false);
+    };
+
+    const formValido = formEmprestimo.clienteId && formEmprestimo.valorOriginal && formEmprestimo.valorPrevisto && formEmprestimo.vencimento;
+
+    // Calculadora de juros
+    const calcJurosPerc = parseFloat(formEmprestimo.calcPerc) || 0;
+    const calcJurosValor = valorEmprestadoNum > 0 && calcJurosPerc > 0 ? valorEmprestadoNum * (calcJurosPerc / 100) : 0;
+    const calcTotal = valorEmprestadoNum + calcJurosValor;
+
     return (
       <Wrapper pagina={pagina} navegar={navegar}>
         <TopBar titulo="Novo empréstimo" onBack={() => navegar("dashboard")} />
@@ -748,28 +933,137 @@ export default function App() {
               <option value="">Selecione um cliente</option>
               {clientes.map((c) => <option key={c.id} value={c.id}>{c.nomeCompleto}</option>)}
             </select>
+
             <label style={labelStyle}>Valor emprestado (R$)</label>
             <input type="number" value={formEmprestimo.valorOriginal} onChange={(e) => setFormEmprestimo({ ...formEmprestimo, valorOriginal: e.target.value })} placeholder="0,00" style={{ ...inputStyle, marginBottom: 10 }} />
-            {valorNum > 0 && (
-              <div style={{ background: AZUL_BG, borderRadius: 10, padding: "0.75rem 1rem", marginBottom: 14, fontSize: 13 }}>
-                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}><span style={{ color: AZUL }}>Valor a pagar (com 40%)</span><span style={{ fontWeight: 600, color: AZUL }}>{formatBRL(valorComJuros)}</span></div>
-                <p style={{ fontSize: 11, color: AZUL, margin: 0, opacity: 0.85 }}>Se não for pago na data, soma 10% deste valor por dia de atraso</p>
+
+            {/* Calculadora de juros */}
+            {valorEmprestadoNum > 0 && (
+              <div style={{ background: BG_CARD_2, borderRadius: 10, padding: "0.75rem 1rem", marginBottom: 10 }}>
+                <p style={{ fontSize: 12, color: TEXTO_SEC, margin: "0 0 8px", fontWeight: 600 }}>Calculadora de juros</p>
+                <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 6 }}>
+                  <input
+                    type="number" placeholder="% de juros" value={formEmprestimo.calcPerc || ""}
+                    onChange={(e) => setFormEmprestimo({ ...formEmprestimo, calcPerc: e.target.value })}
+                    style={{ ...inputStyle, flex: 1 }}
+                  />
+                  <span style={{ fontSize: 13, color: TEXTO_SEC }}>%</span>
+                </div>
+                {calcJurosPerc > 0 && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between" }}>
+                      <span style={{ color: TEXTO_SEC }}>Juros ({calcJurosPerc}%)</span>
+                      <span style={{ color: VERDE }}>{formatBRL(calcJurosValor)}</span>
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "space-between" }}>
+                      <span style={{ color: TEXTO_SEC }}>Total a receber</span>
+                      <span style={{ fontWeight: 600 }}>{formatBRL(calcTotal)}</span>
+                    </div>
+                    <button
+                      onClick={() => setFormEmprestimo({ ...formEmprestimo, valorPrevisto: calcTotal.toFixed(2) })}
+                      style={{ ...btnSecundario, fontSize: 12, padding: "6px", marginTop: 4 }}
+                    >
+                      Usar esse valor →
+                    </button>
+                  </div>
+                )}
               </div>
             )}
-            <label style={labelStyle}>Data de início</label>
-            <input type="text" value={new Date().toLocaleDateString("pt-BR")} disabled style={{ ...inputStyle, marginBottom: 10, opacity: 0.6 }} />
-            <label style={labelStyle}>Data de pagamento</label>
+
+            <label style={labelStyle}>Valor previsto para receber (R$)</label>
+            <input type="number" value={formEmprestimo.valorPrevisto} onChange={(e) => setFormEmprestimo({ ...formEmprestimo, valorPrevisto: e.target.value })} placeholder="0,00" style={{ ...inputStyle, marginBottom: 10 }} />
+
+            {valorEmprestadoNum > 0 && valorPrevistoNum > 0 && (
+              <div style={{ background: AZUL_BG, borderRadius: 10, padding: "0.75rem 1rem", marginBottom: 14, fontSize: 13 }}>
+                <div style={{ display: "flex", justifyContent: "space-between" }}>
+                  <span style={{ color: AZUL }}>Lucro previsto</span>
+                  <span style={{ fontWeight: 600, color: AZUL }}>{formatBRL(lucroPrevisto)}</span>
+                </div>
+              </div>
+            )}
+
+            <label style={labelStyle}>Conta de origem do dinheiro</label>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+              {contasOrigem.map((conta) => (
+                <button
+                  key={conta}
+                  onClick={() => setFormEmprestimo({ ...formEmprestimo, contaOrigem: conta })}
+                  style={{
+                    padding: "8px 14px", fontSize: 13, borderRadius: 10,
+                    background: formEmprestimo.contaOrigem === conta ? ACENTO : BG_CARD_2,
+                    color: formEmprestimo.contaOrigem === conta ? "#06251A" : TEXTO,
+                    border: `1px solid ${formEmprestimo.contaOrigem === conta ? ACENTO : BORDA}`,
+                  }}
+                >
+                  {conta}
+                </button>
+              ))}
+              <button onClick={() => setMostrarNovaConta(!mostrarNovaConta)} style={{ ...btnSecundario, padding: "8px 14px", fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}>
+                <Plus size={13} aria-hidden="true" /> Nova conta
+              </button>
+            </div>
+            {mostrarNovaConta && (
+              <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+                <input
+                  type="text" value={novaContaInput} onChange={(e) => setNovaContaInput(e.target.value)}
+                  placeholder="Ex: Bradesco, Caixa..." style={{ ...inputStyle, flex: 1 }}
+                />
+                <button onClick={adicionarNovaConta} style={btnPrimario}>Adicionar</button>
+              </div>
+            )}
+
+            <label style={labelStyle}>Data de pagamento {formEmprestimo.formaPagamento === "parcelado" ? "(última parcela)" : ""}</label>
             <input type="date" value={formEmprestimo.vencimento} onChange={(e) => setFormEmprestimo({ ...formEmprestimo, vencimento: e.target.value })} style={{ ...inputStyle, marginBottom: 14 }} />
 
-            <PagamentoForm
-              pagamento={formEmprestimo.pagamento}
-              setPagamento={(novoPagamento) => setFormEmprestimo({ ...formEmprestimo, pagamento: novoPagamento })}
-              inputStyle={inputStyle} labelStyle={labelStyle}
-            />
+            <label style={labelStyle}>Pagamento</label>
+            <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+              <button
+                onClick={() => setFormEmprestimo({ ...formEmprestimo, formaPagamento: "avista" })}
+                style={{ flex: 1, padding: "10px", fontSize: 13, borderRadius: 10, background: formEmprestimo.formaPagamento === "avista" ? ACENTO : BG_CARD_2, color: formEmprestimo.formaPagamento === "avista" ? "#06251A" : TEXTO, border: `1px solid ${formEmprestimo.formaPagamento === "avista" ? ACENTO : BORDA}` }}
+              >
+                À vista
+              </button>
+              <button
+                onClick={ativarParcelado}
+                style={{ flex: 1, padding: "10px", fontSize: 13, borderRadius: 10, background: formEmprestimo.formaPagamento === "parcelado" ? ACENTO : BG_CARD_2, color: formEmprestimo.formaPagamento === "parcelado" ? "#06251A" : TEXTO, border: `1px solid ${formEmprestimo.formaPagamento === "parcelado" ? ACENTO : BORDA}` }}
+              >
+                Parcelado
+              </button>
+            </div>
+
+            {formEmprestimo.formaPagamento === "parcelado" && (
+              <div style={{ ...cardStyle, marginBottom: 14 }}>
+                <label style={labelStyle}>Quantidade de parcelas</label>
+                <input
+                  type="number" min="2" value={formEmprestimo.numParcelas}
+                  onChange={(e) => atualizarNumParcelas(parseInt(e.target.value) || 2)}
+                  style={{ ...inputStyle, marginBottom: 12, width: "100%" }}
+                />
+                {(formEmprestimo.parcelasDetalhe || []).map((p, i) => (
+                  <div key={i} style={{ display: "flex", gap: 8, marginBottom: 8, alignItems: "center" }}>
+                    <span style={{ fontSize: 12, color: TEXTO_SEC, width: 36 }}>{i + 1}ª</span>
+                    <input
+                      type="number" placeholder="Valor (R$)" value={p.valor}
+                      onChange={(e) => atualizarParcela(i, "valor", e.target.value)}
+                      style={{ ...inputStyle, flex: 1 }}
+                    />
+                    <input
+                      type="date" value={p.data}
+                      onChange={(e) => atualizarParcela(i, "data", e.target.value)}
+                      style={{ ...inputStyle, flex: 1 }}
+                    />
+                  </div>
+                ))}
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginTop: 8, color: somaParcelas === valorPrevistoNum ? VERDE : AMARELO }}>
+                  <span>Soma das parcelas</span>
+                  <span style={{ fontWeight: 600 }}>{formatBRL(somaParcelas)} {valorPrevistoNum > 0 && `/ ${formatBRL(valorPrevistoNum)}`}</span>
+                </div>
+              </div>
+            )}
 
             <label style={labelStyle}>Observação (opcional)</label>
             <input type="text" value={formEmprestimo.observacao} onChange={(e) => setFormEmprestimo({ ...formEmprestimo, observacao: e.target.value })} placeholder="Ex: combinado em parcelas..." style={{ ...inputStyle, marginBottom: 16 }} />
-            <button onClick={adicionarEmprestimo} disabled={!formEmprestimo.clienteId || !formEmprestimo.valorOriginal || !formEmprestimo.vencimento} style={{ ...btnPrimario, opacity: (!formEmprestimo.clienteId || !formEmprestimo.valorOriginal || !formEmprestimo.vencimento) ? 0.5 : 1 }}>Registrar empréstimo</button>
+            <button onClick={adicionarEmprestimo} disabled={!formValido} style={{ ...btnPrimario, opacity: !formValido ? 0.5 : 1 }}>Registrar empréstimo</button>
           </>
         )}
       </Wrapper>
@@ -806,11 +1100,21 @@ export default function App() {
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           {emprestimosFiltrados.length === 0 && <p style={{ fontSize: 13, color: TEXTO_SEC, textAlign: "center", padding: "1rem 0" }}>Nada por aqui com esse filtro.</p>}
           {emprestimosFiltrados.map((e) => {
-            const cliente = getCliente(e.clienteId); const status = statusEmprestimo(e); const cfg = STATUS_CFG[status];
-            const { valorComJuros, atraso, multa, totalDevido } = calcularValoresEmprestimo(e);
-            const dataFormatada = new Date(e.vencimento + "T00:00:00").toLocaleDateString("pt-BR");
+            const cliente = getCliente(e.clienteId);
+            const parcelasDoEmp = parcelas.filter((p) => p.emprestimoId === e.id).sort((a, b) => a.numero - b.numero);
+            const totalDevido = totalDevidoEmprestimoPorParcelas(parcelasDoEmp);
+            const algumaAtrasada = parcelasDoEmp.some((p) => statusParcela(p) === "atrasado");
+            const algumaProxima = parcelasDoEmp.some((p) => statusParcela(p) === "proximo");
+            const status = e.pago ? "pago" : algumaAtrasada ? "atrasado" : algumaProxima ? "proximo" : "ok";
+            const cfg = STATUS_CFG[status];
+            const proximaPendente = parcelasDoEmp.find((p) => !p.pago);
+            const dataFormatada = proximaPendente ? new Date(proximaPendente.vencimento + "T00:00:00").toLocaleDateString("pt-BR") : "";
             return (
-              <div key={e.id} style={{ ...cardStyle, opacity: e.pago ? 0.65 : 1 }}>
+              <div
+                key={e.id}
+                onClick={() => { setEmprestimoSelecionado(e.id); setPagina("detalheEmprestimo"); }}
+                style={{ ...cardStyle, opacity: e.pago ? 0.65 : 1, cursor: "pointer" }}
+              >
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 6 }}>
                   <div>
                     <p style={{ fontSize: 15, fontWeight: 600, margin: 0 }}>{cliente ? cliente.nomeCompleto : "Cliente removido"}</p>
@@ -822,15 +1126,13 @@ export default function App() {
                   </div>
                   <p style={{ fontSize: 17, fontWeight: 700, margin: 0 }}>{formatBRL(totalDevido)}</p>
                 </div>
-                {!e.pago && <div style={{ fontSize: 11, color: TEXTO_TERC, marginBottom: 8 }}>Com 40%: {formatBRL(valorComJuros)}{atraso > 0 && ` · Juros de atraso (${atraso}d): ${formatBRL(multa)}`}</div>}
-                {e.observacao && <p style={{ fontSize: 13, color: TEXTO_SEC, margin: "0 0 8px" }}>{e.observacao}</p>}
-                {e.pagamento && e.pagamento.metodo && (
+                {e.contaOrigem && <p style={{ fontSize: 11, color: TEXTO_TERC, margin: "0 0 4px" }}>Saiu de: {e.contaOrigem}</p>}
+                {parcelasDoEmp.length > 1 && (
                   <p style={{ fontSize: 11, color: TEXTO_TERC, margin: "0 0 8px" }}>
-                    {e.pagamento.metodo === "cartao" && `Cartão · ${e.pagamento.parcelas || 1}x`}
-                    {e.pagamento.metodo === "dinheiro" && `Dinheiro · ${e.pagamento.comEntrada ? `com entrada de ${formatBRL(parseFloat(e.pagamento.valorEntrada) || 0)}` : "sem entrada"}`}
-                    {e.pagamento.combinadoParcelas && ` · ${e.pagamento.combinadoParcelas}`}
+                    Parcelado em {parcelasDoEmp.length}x · {parcelasDoEmp.filter((p) => p.pago).length} paga{parcelasDoEmp.filter((p) => p.pago).length !== 1 ? "s" : ""}
                   </p>
                 )}
+                {e.observacao && <p style={{ fontSize: 13, color: TEXTO_SEC, margin: "0 0 8px" }}>{e.observacao}</p>}
                 {e.pago && e.avaliacao && (
                   <p style={{ fontSize: 11, color: TEXTO_TERC, margin: "0 0 8px" }}>
                     {e.avaliacao === "antecipado" && "Pagou antes ou na data certa"}
@@ -842,17 +1144,164 @@ export default function App() {
                   <span style={{ fontSize: 12, fontWeight: 500, padding: "3px 10px", borderRadius: 8, background: cfg.bg, color: cfg.text, display: "inline-flex", alignItems: "center", gap: 4 }}>
                     {status === "atrasado" && <AlertTriangle size={12} aria-hidden="true" />}
                     {status === "proximo" && <Clock size={12} aria-hidden="true" />}
-                    {e.pago ? "Pago" : status === "atrasado" ? `Atrasado há ${atraso} dia${atraso !== 1 ? "s" : ""}` : `Vence em ${dataFormatada}`}
+                    {e.pago ? "Pago" : status === "atrasado" ? "Parcela atrasada" : dataFormatada ? `Próx. vence em ${dataFormatada}` : ""}
                   </span>
                   <div style={{ display: "flex", gap: 6 }}>
-                    <button onClick={() => togglePago(e.id)} style={{ ...btnSecundario, padding: "4px 8px", fontSize: 12, display: "flex", alignItems: "center", gap: 4 }}><Check size={13} aria-hidden="true" /> {e.pago ? "Reabrir" : "Pago"}</button>
-                    <button onClick={() => excluirEmprestimo(e.id)} aria-label="Excluir" style={{ ...btnSecundario, padding: "4px 8px" }}><X size={13} aria-hidden="true" /></button>
+                    <span style={{ fontSize: 12, color: TEXTO_SEC, display: "flex", alignItems: "center", gap: 4 }}>
+                      Ver parcelas <ChevronRight size={13} aria-hidden="true" />
+                    </span>
                   </div>
                 </div>
               </div>
             );
           })}
         </div>
+      </Wrapper>
+    );
+  }
+
+  // ================= DETALHE EMPRÉSTIMO (parcelas) =================
+  if (pagina === "detalheEmprestimo" && emprestimoSelecionado) {
+    const emp = emprestimos.find((e) => e.id === emprestimoSelecionado);
+    if (!emp) { setPagina("historico"); return null; }
+    const cliente = getCliente(emp.clienteId);
+    const parcelasDoEmp = parcelas.filter((p) => p.emprestimoId === emp.id).sort((a, b) => a.numero - b.numero);
+    const totalDevido = totalDevidoEmprestimoPorParcelas(parcelasDoEmp);
+    const parcelaRenegociando = renegociandoParcela ? parcelasDoEmp.find((p) => p.id === renegociandoParcela) : null;
+
+    return (
+      <Wrapper pagina={pagina} navegar={navegar}>
+        {parcelaRenegociando && (
+          <div style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, zIndex: 40, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+            <div style={{ background: BG_CARD, border: `1px solid ${BORDA}`, borderRadius: 16, padding: "1.5rem 1.25rem", width: "85%", maxWidth: 320, boxSizing: "border-box" }}>
+              <p style={{ fontSize: 15, fontWeight: 600, margin: "0 0 4px" }}>Renegociar parcela {parcelaRenegociando.numero}</p>
+              <p style={{ fontSize: 12, color: TEXTO_SEC, margin: "0 0 16px" }}>
+                Valor original: {formatBRL(parcelaRenegociando.valorOriginal)}. Define o novo valor final acordado.
+              </p>
+              <label style={labelStyle}>Novo valor final (R$)</label>
+              <input type="number" value={valorRenegociacao} onChange={(e) => setValorRenegociacao(e.target.value)} placeholder="0,00" style={{ ...inputStyle, marginBottom: 14 }} />
+              <button onClick={confirmarRenegociacao} disabled={!valorRenegociacao} style={{ ...btnPrimario, opacity: !valorRenegociacao ? 0.5 : 1, marginBottom: 8 }}>Confirmar renegociação</button>
+              <button onClick={() => { setRenegociandoParcela(null); setValorRenegociacao(""); }} style={{ width: "100%", fontSize: 12, border: "none", background: "transparent", color: TEXTO_SEC }}>Cancelar</button>
+            </div>
+          </div>
+        )}
+
+        {editandoEmprestimo === emp.id && (
+          <div style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, zIndex: 40, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+            <div style={{ background: BG_CARD, border: `1px solid ${BORDA}`, borderRadius: 16, padding: "1.5rem 1.25rem", width: "85%", maxWidth: 340, boxSizing: "border-box" }}>
+              <p style={{ fontSize: 15, fontWeight: 600, margin: "0 0 16px" }}>Editar empréstimo</p>
+              <label style={labelStyle}>Valor emprestado (R$)</label>
+              <input type="number" value={formEdicao.valorOriginal || ""} onChange={(e) => setFormEdicao({ ...formEdicao, valorOriginal: e.target.value })} style={{ ...inputStyle, marginBottom: 10 }} />
+              <label style={labelStyle}>Valor a receber (R$)</label>
+              <input type="number" value={formEdicao.valorPrevisto || ""} onChange={(e) => setFormEdicao({ ...formEdicao, valorPrevisto: e.target.value })} style={{ ...inputStyle, marginBottom: 10 }} />
+              <label style={labelStyle}>Data de vencimento</label>
+              <input type="date" value={formEdicao.vencimento || ""} onChange={(e) => setFormEdicao({ ...formEdicao, vencimento: e.target.value })} style={{ ...inputStyle, marginBottom: 10 }} />
+              <label style={labelStyle}>Observação</label>
+              <input type="text" value={formEdicao.observacao || ""} onChange={(e) => setFormEdicao({ ...formEdicao, observacao: e.target.value })} style={{ ...inputStyle, marginBottom: 14 }} />
+              <button onClick={salvarEdicaoEmprestimo} style={{ ...btnPrimario, marginBottom: 8 }}>Salvar alterações</button>
+              <button onClick={() => setEditandoEmprestimo(null)} style={{ width: "100%", fontSize: 12, border: "none", background: "transparent", color: TEXTO_SEC }}>Cancelar</button>
+            </div>
+          </div>
+        )}
+
+        {editandoParcela && (
+          <div style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, zIndex: 40, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+            <div style={{ background: BG_CARD, border: `1px solid ${BORDA}`, borderRadius: 16, padding: "1.5rem 1.25rem", width: "85%", maxWidth: 340, boxSizing: "border-box" }}>
+              <p style={{ fontSize: 15, fontWeight: 600, margin: "0 0 16px" }}>Editar parcela</p>
+              <label style={labelStyle}>Valor da parcela (R$)</label>
+              <input type="number" value={formEdicao.valorOriginal || ""} onChange={(e) => setFormEdicao({ ...formEdicao, valorOriginal: e.target.value })} style={{ ...inputStyle, marginBottom: 10 }} />
+              <label style={labelStyle}>Data de vencimento</label>
+              <input type="date" value={formEdicao.vencimento || ""} onChange={(e) => setFormEdicao({ ...formEdicao, vencimento: e.target.value })} style={{ ...inputStyle, marginBottom: 14 }} />
+              <button onClick={salvarEdicaoParcela} style={{ ...btnPrimario, marginBottom: 8 }}>Salvar alterações</button>
+              <button onClick={() => setEditandoParcela(null)} style={{ width: "100%", fontSize: 12, border: "none", background: "transparent", color: TEXTO_SEC }}>Cancelar</button>
+            </div>
+          </div>
+        )}
+
+        <TopBar titulo="Detalhe do empréstimo" onBack={() => setPagina("historico")} />
+
+        <div style={{ ...cardStyle, marginBottom: "1rem" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 4 }}>
+            <p style={{ fontSize: 16, fontWeight: 600, margin: 0 }}>{cliente ? cliente.nomeCompleto : "Cliente removido"}</p>
+            <button onClick={() => abrirEdicaoEmprestimo(emp)} style={{ ...btnSecundario, padding: "4px 10px", fontSize: 12 }}>Editar</button>
+          </div>
+          <p style={{ fontSize: 12, color: TEXTO_SEC, margin: "0 0 10px" }}>
+            Emprestado: {formatBRL(emp.valorOriginal)} {emp.contaOrigem && `· Saiu de: ${emp.contaOrigem}`}
+          </p>
+          <div style={{ borderTop: `1px solid ${BORDA}`, paddingTop: 10, display: "flex", justifyContent: "space-between" }}>
+            <span style={{ fontSize: 13, color: TEXTO_SEC }}>Total a receber</span>
+            <span style={{ fontSize: 17, fontWeight: 700 }}>{formatBRL(totalDevido)}</span>
+          </div>
+        </div>
+
+        <p style={{ fontSize: 13, fontWeight: 600, margin: "0 0 8px" }}>
+          {parcelasDoEmp.length > 1 ? `Parcelas (${parcelasDoEmp.filter((p) => p.pago).length}/${parcelasDoEmp.length} pagas)` : "Pagamento"}
+        </p>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: "1.5rem" }}>
+          {parcelasDoEmp.map((p) => {
+            const status = statusParcela(p);
+            const cfg = STATUS_CFG[status];
+            const { atraso, multa, totalDevido: totalParcela } = calcularValoresParcela(p);
+            const dataFormatada = new Date(p.vencimento + "T00:00:00").toLocaleDateString("pt-BR");
+            return (
+              <div key={p.id} style={{ ...cardStyle, opacity: p.pago ? 0.65 : 1 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 6 }}>
+                  <div>
+                    <p style={{ fontSize: 14, fontWeight: 600, margin: 0 }}>
+                      {parcelasDoEmp.length > 1 ? `Parcela ${p.numero}/${parcelasDoEmp.length}` : "Pagamento único"}
+                    </p>
+                    <p style={{ fontSize: 11, color: TEXTO_TERC, margin: "2px 0 0" }}>Vence em {dataFormatada}</p>
+                  </div>
+                  <p style={{ fontSize: 16, fontWeight: 700, margin: 0 }}>{formatBRL(totalParcela)}</p>
+                </div>
+
+                {p.renegociado ? (
+                  <div style={{ background: AMARELO_BG, borderRadius: 8, padding: "6px 10px", marginBottom: 8, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <span style={{ fontSize: 11, color: AMARELO }}>Renegociada (original: {formatBRL(p.valorOriginal)})</span>
+                  </div>
+                ) : (
+                  !p.pago && atraso > 0 && (
+                    <p style={{ fontSize: 11, color: TEXTO_TERC, margin: "0 0 8px" }}>
+                      Original: {formatBRL(p.valorOriginal)} · Multa atraso ({atraso}d): {formatBRL(multa)}
+                    </p>
+                  )
+                )}
+
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span style={{ fontSize: 12, fontWeight: 500, padding: "3px 10px", borderRadius: 8, background: cfg.bg, color: cfg.text, display: "inline-flex", alignItems: "center", gap: 4 }}>
+                    {status === "atrasado" && <AlertTriangle size={12} aria-hidden="true" />}
+                    {status === "proximo" && <Clock size={12} aria-hidden="true" />}
+                    {p.pago ? "Pago" : status === "atrasado" ? `Atrasada há ${atraso} dia${atraso !== 1 ? "s" : ""}` : "Pendente"}
+                  </span>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    <button onClick={() => abrirEdicaoParcela(p)} style={{ ...btnSecundario, padding: "4px 8px", fontSize: 12 }}>Editar</button>
+                    <button onClick={() => (p.renegociado ? removerRenegociacao(p.id) : abrirRenegociacao(p.id))} style={{ ...btnSecundario, padding: "4px 8px", fontSize: 12 }}>
+                      {p.renegociado ? "Desfazer" : "Renegociar"}
+                    </button>
+                    <button onClick={() => togglePagoParcela(p.id)} style={{ ...btnSecundario, padding: "4px 8px", fontSize: 12, display: "flex", alignItems: "center", gap: 4 }}>
+                      <Check size={13} aria-hidden="true" /> {p.pago ? "Reabrir" : "Pago"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {emp.observacao && (
+          <div style={{ ...cardStyle, marginBottom: "1rem" }}>
+            <p style={{ fontSize: 12, color: TEXTO_SEC, margin: "0 0 4px" }}>Observação</p>
+            <p style={{ fontSize: 13, margin: 0 }}>{emp.observacao}</p>
+          </div>
+        )}
+
+        <button
+          onClick={() => { excluirEmprestimo(emp.id); setPagina("historico"); }}
+          style={{ width: "100%", background: VERMELHO_BG, color: VERMELHO, border: `1px solid ${VERMELHO}`, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}
+        >
+          <Trash2 size={14} aria-hidden="true" /> Excluir empréstimo
+        </button>
       </Wrapper>
     );
   }
@@ -976,54 +1425,127 @@ export default function App() {
     );
   }
 
-  // ================= DESEMPENHO TOTAL =================
-  if (pagina === "desempenho") {
-    const totalEmprestadoGeral = emprestimos.reduce((a, e) => a + e.valorOriginal, 0);
-    const totalRetornoGeral = emprestimos.reduce((a, e) => a + calcularValoresEmprestimo(e).totalDevido, 0);
-    const totalLucroEmprestimoGeral = totalRetornoGeral - totalEmprestadoGeral;
-    const totalRecebidoGeral = emprestimos.filter((e) => e.pago).reduce((a, e) => a + calcularValoresEmprestimo(e).totalDevido, 0);
-    const totalPendenteGeral = emprestimos.filter((e) => !e.pago).reduce((a, e) => a + calcularValoresEmprestimo(e).totalDevido, 0);
-    const totalAtrasadoGeral = emprestimos.filter((e) => statusEmprestimo(e) === "atrasado").reduce((a, e) => a + calcularValoresEmprestimo(e).totalDevido, 0);
+  // ================= FINANÇAS / CONTABILIDADE =================
+  if (pagina === "contabilidade" || pagina === "desempenho") {
+    const agr = new Date();
+    const mesAtualLabel = agr.toLocaleDateString("pt-BR", { month: "long", year: "numeric" });
 
+    // Totais gerais empréstimos
+    const totalEmprestadoGeral = emprestimos.reduce((a, e) => a + e.valorOriginal, 0);
+    const totalRetornoGeral = parcelas.reduce((a, p) => a + calcularValoresParcela(p).totalDevido, 0);
+    const totalLucroEmprestimoGeral = totalRetornoGeral - totalEmprestadoGeral;
+    const totalRecebidoGeral = parcelas.filter((p) => p.pago).reduce((a, p) => a + calcularValoresParcela(p).totalDevido, 0);
+    const totalPendenteGeral = parcelas.filter((p) => !p.pago).reduce((a, p) => a + calcularValoresParcela(p).totalDevido, 0);
+    const totalAtrasadoGeral = parcelas.filter((p) => statusParcela(p) === "atrasado").reduce((a, p) => a + calcularValoresParcela(p).totalDevido, 0);
+
+    // Totais vendas
     const produtosVendidos = produtos.filter((p) => p.vendido);
     const totalInvestidoVendasGeral = produtosVendidos.reduce((a, p) => a + p.precoCompra, 0);
     const totalVendidoGeral = produtosVendidos.reduce((a, p) => a + (p.precoVenda || 0), 0);
     const totalLucroVendasGeral = totalVendidoGeral - totalInvestidoVendasGeral;
-
     const lucroTotalCombinado = totalLucroEmprestimoGeral + totalLucroVendasGeral;
+
+    // Breakdown por conta de origem (empréstimos)
+    const contasUsadas = [...new Set(emprestimos.filter((e) => e.contaOrigem).map((e) => e.contaOrigem))];
+    const breakdownContas = contasUsadas.map((conta) => {
+      const empsda = emprestimos.filter((e) => e.contaOrigem === conta);
+      const emprestado = empsda.reduce((a, e) => a + e.valorOriginal, 0);
+      const parcelasDaConta = parcelas.filter((p) => empsda.some((e) => e.id === p.emprestimoId));
+      const retorno = parcelasDaConta.reduce((a, p) => a + calcularValoresParcela(p).totalDevido, 0);
+      const recebido = parcelasDaConta.filter((p) => p.pago).reduce((a, p) => a + calcularValoresParcela(p).totalDevido, 0);
+      const pendente = parcelasDaConta.filter((p) => !p.pago).reduce((a, p) => a + calcularValoresParcela(p).totalDevido, 0);
+      const lucro = retorno - emprestado;
+      return { conta, emprestado, retorno, recebido, pendente, lucro };
+    });
+
+    // Lucro mensal (últimos 6 meses)
+    const meses = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"];
+    const dadosMensais = [];
+    for (let i = 5; i >= 0; i--) {
+      const d = new Date(agr.getFullYear(), agr.getMonth() - i, 1);
+      const proximo = new Date(agr.getFullYear(), agr.getMonth() - i + 1, 1);
+      const empDoMes = emprestimos.filter((e) => {
+        const c = new Date(e.criadoEm);
+        return c >= d && c < proximo;
+      });
+      const emprestadoMes = empDoMes.reduce((a, e) => a + e.valorOriginal, 0);
+      const retornoMes = empDoMes.reduce((a, e) => a + totalDevidoEmprestimoPorParcelas(parcelas.filter((p) => p.emprestimoId === e.id)), 0);
+      const vendasMes = produtosVendidos.filter((p) => { const v = new Date(p.vendidoEm); return v >= d && v < proximo; });
+      const lucroVendasMes = vendasMes.reduce((a, p) => a + (p.precoVenda || 0) - p.precoCompra, 0);
+      dadosMensais.push({ label: meses[d.getMonth()], emprestado: emprestadoMes, retorno: retornoMes, lucroEmp: retornoMes - emprestadoMes, lucroVendas: lucroVendasMes });
+    }
 
     return (
       <Wrapper pagina={pagina} navegar={navegar}>
-        <TopBar titulo="Desempenho total" />
-        <p style={{ fontSize: 12, color: TEXTO_SEC, marginBottom: "1.25rem" }}>Acumulado desde o início, sem zerar por mês.</p>
+        <TopBar titulo="Finanças" />
 
-        <div style={{ background: BG_CARD, border: `1px solid ${ACENTO}`, borderRadius: 14, padding: "1.25rem", marginBottom: 16 }}>
-          <p style={{ fontSize: 12, color: TEXTO_SEC, margin: "0 0 6px" }}>Lucro total combinado</p>
+        {/* Lucro total */}
+        <div style={{ background: BG_CARD, border: `1px solid ${ACENTO}`, borderRadius: 14, padding: "1.25rem", marginBottom: 12 }}>
+          <p style={{ fontSize: 12, color: TEXTO_SEC, margin: "0 0 4px" }}>Lucro total acumulado</p>
           <p style={{ fontSize: 28, fontWeight: 700, margin: 0, color: lucroTotalCombinado >= 0 ? VERDE : VERMELHO }}>{formatBRL(lucroTotalCombinado)}</p>
+          <div style={{ display: "flex", gap: 16, marginTop: 12 }}>
+            <div><p style={{ fontSize: 11, color: TEXTO_SEC, margin: "0 0 2px" }}>Empréstimos</p><p style={{ fontSize: 13, fontWeight: 600, margin: 0, color: VERDE }}>{formatBRL(totalLucroEmprestimoGeral)}</p></div>
+            <div><p style={{ fontSize: 11, color: TEXTO_SEC, margin: "0 0 2px" }}>Vendas</p><p style={{ fontSize: 13, fontWeight: 600, margin: 0, color: totalLucroVendasGeral >= 0 ? VERDE : VERMELHO }}>{formatBRL(totalLucroVendasGeral)}</p></div>
+          </div>
         </div>
 
-        <p style={{ fontSize: 13, fontWeight: 600, margin: "0 0 8px", display: "flex", alignItems: "center", gap: 6 }}><User size={14} aria-hidden="true" /> Empréstimos</p>
-        <div style={{ ...cardStyle, marginBottom: 16 }}>
+        {/* Gráfico mensal */}
+        <p style={{ fontSize: 13, fontWeight: 600, margin: "0 0 8px" }}>Lucro mensal (últimos 6 meses)</p>
+        <div style={{ height: 140, marginBottom: 16 }}>
+          <ResponsiveContainer width="100%" height="100%">
+            <BarChart data={dadosMensais} margin={{ top: 0, right: 0, left: -20, bottom: 0 }}>
+              <CartesianGrid vertical={false} stroke={BORDA} />
+              <XAxis dataKey="label" tick={{ fontSize: 11, fill: TEXTO_SEC }} axisLine={false} tickLine={false} />
+              <YAxis tick={{ fontSize: 10, fill: TEXTO_SEC }} axisLine={false} tickLine={false} tickFormatter={(v) => `${(v/1000).toFixed(1)}k`} width={36} />
+              <Tooltip formatter={(value) => formatBRL(value)} contentStyle={{ fontSize: 12, borderRadius: 8, background: BG_CARD_2, border: `1px solid ${BORDA}` }} labelStyle={{ color: TEXTO }} />
+              <Bar dataKey="lucroEmp" name="Empr." fill={AZUL} radius={[3, 3, 0, 0]} />
+              <Bar dataKey="lucroVendas" name="Vendas" fill={ACENTO} radius={[3, 3, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+
+        {/* Breakdown por conta */}
+        {breakdownContas.length > 0 && (
+          <>
+            <p style={{ fontSize: 13, fontWeight: 600, margin: "0 0 8px" }}>Por conta de origem</p>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 16 }}>
+              {breakdownContas.map((b) => (
+                <div key={b.conta} style={cardStyle}>
+                  <p style={{ fontSize: 14, fontWeight: 600, margin: "0 0 10px" }}>{b.conta}</p>
+                  <div style={{ display: "flex", justifyContent: "space-between", padding: "4px 0" }}><span style={{ fontSize: 12, color: TEXTO_SEC }}>Emprestado</span><span style={{ fontSize: 12, fontWeight: 600 }}>{formatBRL(b.emprestado)}</span></div>
+                  <div style={{ display: "flex", justifyContent: "space-between", padding: "4px 0" }}><span style={{ fontSize: 12, color: TEXTO_SEC }}>Já recebido</span><span style={{ fontSize: 12, fontWeight: 600, color: VERDE }}>{formatBRL(b.recebido)}</span></div>
+                  <div style={{ display: "flex", justifyContent: "space-between", padding: "4px 0" }}><span style={{ fontSize: 12, color: TEXTO_SEC }}>Ainda pendente</span><span style={{ fontSize: 12, fontWeight: 600, color: AMARELO }}>{formatBRL(b.pendente)}</span></div>
+                  <div style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", marginTop: 4, borderTop: `1px solid ${BORDA}` }}><span style={{ fontSize: 12, fontWeight: 600 }}>Lucro previsto</span><span style={{ fontSize: 13, fontWeight: 700, color: b.lucro >= 0 ? VERDE : VERMELHO }}>{formatBRL(b.lucro)}</span></div>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+
+        {/* Empréstimos detalhado */}
+        <p style={{ fontSize: 13, fontWeight: 600, margin: "0 0 8px", display: "flex", alignItems: "center", gap: 6 }}><User size={14} aria-hidden="true" /> Empréstimos — total geral</p>
+        <div style={{ ...cardStyle, marginBottom: 12 }}>
           <div style={{ display: "flex", justifyContent: "space-between", padding: "6px 0" }}><span style={{ fontSize: 13, color: TEXTO_SEC }}>Total emprestado</span><span style={{ fontSize: 13, fontWeight: 600 }}>{formatBRL(totalEmprestadoGeral)}</span></div>
-          <div style={{ display: "flex", justifyContent: "space-between", padding: "6px 0" }}><span style={{ fontSize: 13, color: TEXTO_SEC }}>Retorno total (com juros)</span><span style={{ fontSize: 13, fontWeight: 600 }}>{formatBRL(totalRetornoGeral)}</span></div>
           <div style={{ display: "flex", justifyContent: "space-between", padding: "6px 0" }}><span style={{ fontSize: 13, color: TEXTO_SEC }}>Já recebido</span><span style={{ fontSize: 13, fontWeight: 600, color: VERDE }}>{formatBRL(totalRecebidoGeral)}</span></div>
           <div style={{ display: "flex", justifyContent: "space-between", padding: "6px 0" }}><span style={{ fontSize: 13, color: TEXTO_SEC }}>Pendente</span><span style={{ fontSize: 13, fontWeight: 600, color: AMARELO }}>{formatBRL(totalPendenteGeral)}</span></div>
           {totalAtrasadoGeral > 0 && <div style={{ display: "flex", justifyContent: "space-between", padding: "6px 0" }}><span style={{ fontSize: 13, color: TEXTO_SEC }}>Em atraso</span><span style={{ fontSize: 13, fontWeight: 600, color: VERMELHO }}>{formatBRL(totalAtrasadoGeral)}</span></div>}
-          <div style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderTop: `1px solid ${BORDA}`, marginTop: 4 }}><span style={{ fontSize: 13, fontWeight: 600 }}>Lucro</span><span style={{ fontSize: 14, fontWeight: 700, color: VERDE }}>{formatBRL(totalLucroEmprestimoGeral)}</span></div>
+          <div style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderTop: `1px solid ${BORDA}`, marginTop: 4 }}><span style={{ fontSize: 13, fontWeight: 600 }}>Lucro previsto</span><span style={{ fontSize: 14, fontWeight: 700, color: VERDE }}>{formatBRL(totalLucroEmprestimoGeral)}</span></div>
         </div>
 
-        <p style={{ fontSize: 13, fontWeight: 600, margin: "0 0 8px", display: "flex", alignItems: "center", gap: 6 }}><ShoppingBag size={14} aria-hidden="true" /> Vendas</p>
-        <div style={{ ...cardStyle, marginBottom: 16 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", padding: "6px 0" }}><span style={{ fontSize: 13, color: TEXTO_SEC }}>Total investido em produtos vendidos</span><span style={{ fontSize: 13, fontWeight: 600 }}>{formatBRL(totalInvestidoVendasGeral)}</span></div>
+        {/* Vendas detalhado */}
+        <p style={{ fontSize: 13, fontWeight: 600, margin: "0 0 8px", display: "flex", alignItems: "center", gap: 6 }}><ShoppingBag size={14} aria-hidden="true" /> Vendas — total geral</p>
+        <div style={{ ...cardStyle, marginBottom: 12 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", padding: "6px 0" }}><span style={{ fontSize: 13, color: TEXTO_SEC }}>Investido em produtos vendidos</span><span style={{ fontSize: 13, fontWeight: 600 }}>{formatBRL(totalInvestidoVendasGeral)}</span></div>
           <div style={{ display: "flex", justifyContent: "space-between", padding: "6px 0" }}><span style={{ fontSize: 13, color: TEXTO_SEC }}>Total vendido</span><span style={{ fontSize: 13, fontWeight: 600 }}>{formatBRL(totalVendidoGeral)}</span></div>
-          <div style={{ display: "flex", justifyContent: "space-between", padding: "6px 0" }}><span style={{ fontSize: 13, color: TEXTO_SEC }}>Valor parado em estoque</span><span style={{ fontSize: 13, fontWeight: 600, color: AMARELO }}>{formatBRL(valorEmEstoque)}</span></div>
+          <div style={{ display: "flex", justifyContent: "space-between", padding: "6px 0" }}><span style={{ fontSize: 13, color: TEXTO_SEC }}>Em estoque</span><span style={{ fontSize: 13, fontWeight: 600, color: AMARELO }}>{formatBRL(valorEmEstoque)}</span></div>
           <div style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderTop: `1px solid ${BORDA}`, marginTop: 4 }}><span style={{ fontSize: 13, fontWeight: 600 }}>Lucro</span><span style={{ fontSize: 14, fontWeight: 700, color: totalLucroVendasGeral >= 0 ? VERDE : VERMELHO }}>{formatBRL(totalLucroVendasGeral)}</span></div>
         </div>
 
+        {/* Resumo */}
         <p style={{ fontSize: 13, fontWeight: 600, margin: "0 0 8px" }}>Resumo geral</p>
         <div style={cardStyle}>
           <div style={{ display: "flex", justifyContent: "space-between", padding: "8px 0", borderBottom: `1px solid ${BORDA}` }}><span style={{ fontSize: 13, color: TEXTO_SEC }}>Empréstimos feitos</span><span style={{ fontSize: 13, fontWeight: 600 }}>{emprestimos.length}</span></div>
-          <div style={{ display: "flex", justifyContent: "space-between", padding: "8px 0", borderBottom: `1px solid ${BORDA}` }}><span style={{ fontSize: 13, color: TEXTO_SEC }}>Produtos cadastrados</span><span style={{ fontSize: 13, fontWeight: 600 }}>{produtos.length}</span></div>
+          <div style={{ display: "flex", justifyContent: "space-between", padding: "8px 0", borderBottom: `1px solid ${BORDA}` }}><span style={{ fontSize: 13, color: TEXTO_SEC }}>Produtos em estoque</span><span style={{ fontSize: 13, fontWeight: 600 }}>{produtos.filter((p) => !p.vendido).length}</span></div>
           <div style={{ display: "flex", justifyContent: "space-between", padding: "8px 0" }}><span style={{ fontSize: 13, color: TEXTO_SEC }}>Produtos vendidos</span><span style={{ fontSize: 13, fontWeight: 600 }}>{produtosVendidos.length}</span></div>
         </div>
       </Wrapper>
@@ -1043,8 +1565,19 @@ function mapClienteFromDb(c) {
 function mapEmprestimoFromDb(e) {
   return {
     id: e.id, clienteId: e.cliente_id, valorOriginal: parseFloat(e.valor_original),
+    valorPrevisto: e.valor_previsto != null ? parseFloat(e.valor_previsto) : parseFloat(e.valor_original),
+    contaOrigem: e.conta_origem, formaPagamento: e.forma_pagamento, parcelas: e.parcelas || null,
     vencimento: e.vencimento, observacao: e.observacao, pagamento: e.pagamento || {},
     pago: e.pago, pagoEm: e.pago_em, avaliacao: e.avaliacao, criadoEm: e.criado_em,
+  };
+}
+function mapParcelaFromDb(p) {
+  return {
+    id: p.id, emprestimoId: p.emprestimo_id, numero: p.numero,
+    valorOriginal: parseFloat(p.valor_original), vencimento: p.vencimento,
+    pago: p.pago, pagoEm: p.pago_em,
+    renegociado: p.renegociado, valorRenegociado: p.valor_renegociado != null ? parseFloat(p.valor_renegociado) : null,
+    criadoEm: p.criado_em,
   };
 }
 function mapProdutoFromDb(p) {
